@@ -2,9 +2,8 @@
 """
 Convert CommCare XForm XML files to KoboToolbox XLSForm workbooks.
 
-Runtime behavior is controlled by the CONFIG block below. Set
-UPLOAD_TO_KOBO and KOBO_DEPLOY there if you want a plain
-`python commcare_2_kobo.py` run to publish forms.
+Runtime behavior is controlled by environment variables. Put local settings
+and secrets in `.env`; see `.env.example` for the supported keys.
 """
 
 from __future__ import annotations
@@ -46,50 +45,55 @@ def _load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid boolean value for {name}: {value!r}. "
+        "Use true/false, yes/no, on/off, or 1/0."
+    )
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer value for {name}: {value!r}") from exc
+
+
 _load_dotenv(PROJECT_ROOT / ".env")
 
-# ---------------------------------------------------------------------------
-# CONFIG - edit these values before running
-# ---------------------------------------------------------------------------
+# Runtime settings. Values come from `.env` or process environment; defaults
+# keep local dry/folder workflows usable when a key is omitted.
+XML_INPUT_FOLDER = Path(os.getenv("XML_INPUT_FOLDER", PROJECT_ROOT / "XML_INPUT_FOLDER"))
+XLSFORM_OUTPUT_FOLDER = Path(os.getenv("XLSFORM_OUTPUT_FOLDER", PROJECT_ROOT / "XLS_OUTPUT"))
+SAVE_XLSFORMS_LOCALLY = _env_bool("SAVE_XLSFORMS_LOCALLY", True)
 
-# Local XML source and XLSForm output.
-XML_INPUT_FOLDER = PROJECT_ROOT / "XML_INPUT_FOLDER"
-XLSFORM_OUTPUT_FOLDER = PROJECT_ROOT / "XLS_OUTPUT"
-SAVE_XLSFORMS_LOCALLY = True
+UPLOAD_TO_KOBO = _env_bool("UPLOAD_TO_KOBO", False)
+KOBO_API_TOKEN = os.getenv("KOBO_API_TOKEN", "")
+KOBO_SERVER_URL = os.getenv("KOBO_SERVER_URL", "https://eu.kobotoolbox.org")
+KOBO_DEPLOY = _env_bool("KOBO_DEPLOY", False)
 
-# KoboToolbox publishing.
-# Keep KOBO_API_TOKEN blank for GitHub and put it in .env instead.
-UPLOAD_TO_KOBO = True
-KOBO_API_TOKEN = ""  # Example: "paste-token-here", or set KOBO_API_TOKEN in .env
-KOBO_SERVER_URL = "https://eu.kobotoolbox.org"
-KOBO_DEPLOY = True
-
-# CommCare fetch mode. Leave disabled when using XML_INPUT_FOLDER.
-# CommCare's supported API requires plan access and app permissions. If your
-# plan cannot use the Application Structure API, export XML from CommCare and
-# use folder mode instead.
-COMMCARE_FETCH = False
-COMMCARE_DOMAIN = ""
-COMMCARE_USER = ""
-COMMCARE_TOKEN = ""
-COMMCARE_LIMIT = 0
-COMMCARE_BASE_URL = "https://eu.commcarehq.org"
-
-
-# Environment variables can override blank secrets and optional deployment
-# settings without editing source code.
-XML_INPUT_FOLDER = Path(os.getenv("XML_INPUT_FOLDER", XML_INPUT_FOLDER))
-XLSFORM_OUTPUT_FOLDER = Path(os.getenv("XLSFORM_OUTPUT_FOLDER", XLSFORM_OUTPUT_FOLDER))
-KOBO_API_TOKEN = KOBO_API_TOKEN or os.getenv("KOBO_API_TOKEN", "")
-KOBO_SERVER_URL = os.getenv("KOBO_SERVER_URL", KOBO_SERVER_URL)
-COMMCARE_DOMAIN = COMMCARE_DOMAIN or os.getenv("COMMCARE_DOMAIN", "")
-COMMCARE_USER = COMMCARE_USER or os.getenv("COMMCARE_USER", "")
-COMMCARE_TOKEN = COMMCARE_TOKEN or os.getenv("COMMCARE_TOKEN", "")
-COMMCARE_BASE_URL = os.getenv("COMMCARE_BASE_URL", COMMCARE_BASE_URL)
+COMMCARE_FETCH = _env_bool("COMMCARE_FETCH", False)
+COMMCARE_DOMAIN = os.getenv("COMMCARE_DOMAIN", "")
+COMMCARE_USER = os.getenv("COMMCARE_USER", "")
+COMMCARE_TOKEN = os.getenv("COMMCARE_TOKEN", "")
+COMMCARE_LIMIT = _env_int("COMMCARE_LIMIT", 0)
+COMMCARE_BASE_URL = os.getenv("COMMCARE_BASE_URL", "https://www.commcarehq.org")
 
 XFORM_NS = "http://www.w3.org/2002/xforms"
 HTML_NS = "http://www.w3.org/1999/xhtml"
 VALID_XLSFORM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VALID_CHOICE_NAME = re.compile(r"^[^\s]+$")
 
 
 def _commcare_session(user: str, token: str) -> requests.Session:
@@ -104,7 +108,7 @@ def _commcare_session(user: str, token: str) -> requests.Session:
 def _raise_commcare_error(resp: requests.Response, context: str) -> None:
     try:
         message = resp.json().get("error", resp.text)
-    except Exception:
+    except ValueError:
         message = resp.text[:500]
 
     if resp.status_code == 401 and "subscription" in message.lower():
@@ -142,6 +146,43 @@ def _list_commcare_apps(session: requests.Session, domain: str, limit: int = 0) 
         time.sleep(0.2)
 
     return apps[:limit] if limit else apps
+
+
+def _list_commcare_fixture_rows(session: requests.Session, domain: str, fixture_type: str) -> list[dict[str, Any]]:
+    url = f"{COMMCARE_BASE_URL.rstrip('/')}/a/{domain}/api/fixture/v1/"
+    params = {"fixture_type": fixture_type, "limit": 1000, "offset": 0}
+    rows: list[dict[str, Any]] = []
+
+    while True:
+        resp = session.get(url, params=params, timeout=60)
+        if not resp.ok:
+            _raise_commcare_error(resp, f"CommCare fixture fetch for {fixture_type}")
+        data = resp.json()
+        rows.extend(data.get("objects", []))
+        if not data.get("meta", {}).get("next"):
+            break
+        params["offset"] += params["limit"]
+        time.sleep(0.2)
+
+    return rows
+
+
+def _collect_fixture_types(apps: list[dict[str, Any]]) -> list[str]:
+    fixture_types: list[str] = []
+    seen: set[str] = set()
+    for app in apps:
+        for module in app.get("modules", []):
+            for form in module.get("forms", []):
+                for question in form.get("questions", []):
+                    data_source = question.get("data_source") or {}
+                    fixture_type = str(data_source.get("instance_id") or "")
+                    if not fixture_type:
+                        match = re.search(r"item-list:([^'\"/]+)", str(data_source.get("instance_ref") or ""))
+                        fixture_type = match.group(1) if match else ""
+                    if fixture_type and fixture_type not in seen:
+                        seen.add(fixture_type)
+                        fixture_types.append(fixture_type)
+    return fixture_types
 
 
 def _strip_ns(tag: str) -> str:
@@ -190,7 +231,25 @@ def _unique_name(base: str, used: set[str], max_len: int = 64) -> str:
         suffix += 1
 
 
+def _safe_choice_value(value: str, fallback: str, used: set[str]) -> str:
+    value = html.unescape(str(value or "")).strip()
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"[^A-Za-z0-9_.:-]+", "_", value).strip("_")
+    if not value:
+        value = fallback
+    if value in used:
+        suffix = 2
+        base = value[:58]
+        while f"{base}_{suffix}" in used:
+            suffix += 1
+        value = f"{base}_{suffix}"
+    used.add(value)
+    return value
+
+
 def _label_key(ref_str: str) -> str:
+    # When a ref is not in jr:itext('id') form, the original string is returned
+    # and will simply miss the itext lookup, yielding an empty label.
     match = re.search(r"jr:itext\(['\"](.+?)['\"]\)", ref_str or "")
     return match.group(1) if match else ref_str
 
@@ -436,6 +495,8 @@ def _walk_body(
     row.update(_resolve_labels(el, itext, languages))
     survey_rows.append(row)
 
+    # CommCare emits a hidden `score_<question>` calculate bind alongside scored
+    # questions; pull it in as a calculate row so the scoring logic survives.
     score_path = _normalize_ref(ref).rsplit("/", 1)[0] + f"/score_{_ref_leaf(ref)}"
     score_bind = binds_by_path.get(score_path)
     if score_bind and score_bind.get("calculate"):
@@ -453,7 +514,7 @@ def parse_xform(xml_str: str) -> dict[str, Any]:
     title_el = root.find(f".//{{{HTML_NS}}}title")
     title = (title_el.text or "Untitled Form").strip() if title_el is not None else "Untitled Form"
 
-    data_el = root.find(f".//{{{XFORM_NS}}}instance/")
+    data_el = root.find(f".//{{{XFORM_NS}}}instance/*")
     form_id = data_el.attrib.get("name", title) if data_el is not None else title
 
     itext = _find_itext(root)
@@ -506,6 +567,339 @@ def parse_xform(xml_str: str) -> dict[str, Any]:
     }
 
 
+def _translated_text(value: Any, default: str = "") -> str:
+    if isinstance(value, dict):
+        for text in value.values():
+            if text:
+                return str(text)
+        return default
+    return str(value or default)
+
+
+def _question_languages(questions: list[dict[str, Any]]) -> list[str]:
+    languages: list[str] = []
+    for question in questions:
+        translations = question.get("translations") or {}
+        if isinstance(translations, dict):
+            for lang in translations:
+                if lang not in languages:
+                    languages.append(lang)
+        for option in question.get("options") or []:
+            translations = option.get("translations") or {}
+            if isinstance(translations, dict):
+                for lang in translations:
+                    if lang not in languages:
+                        languages.append(lang)
+    return languages or ["default"]
+
+
+def _schema_labels(item: dict[str, Any], languages: list[str], prefix: str = "label") -> dict[str, str]:
+    translations = item.get("translations") or {}
+    fallback = str(item.get("label") or "")
+    labels: dict[str, str] = {}
+    for lang in languages:
+        if isinstance(translations, dict):
+            labels[f"{prefix}::{lang}"] = str(translations.get(lang) or fallback)
+        else:
+            labels[f"{prefix}::{lang}"] = fallback
+    return labels
+
+
+def _fixture_type_from_data_source(data_source: dict[str, Any]) -> str:
+    fixture_type = str(data_source.get("instance_id") or "")
+    if fixture_type:
+        return fixture_type
+    match = re.search(r"item-list:([^'\"/]+)", str(data_source.get("instance_ref") or ""))
+    return match.group(1) if match else ""
+
+
+def _fixture_field_value(row: dict[str, Any], field_name: str) -> str:
+    value = (row.get("fields") or {}).get(field_name, "")
+    if isinstance(value, dict):
+        values = value.get("field_list") or []
+        if values:
+            return str(values[0].get("field_value") or "")
+        return ""
+    return str(value or "")
+
+
+def _choice_extra_column(field_name: str) -> str:
+    column = _safe_identifier(field_name, "field", max_len=64)
+    reserved = {"list_name", "name"}
+    if column in reserved or column.startswith("label") or column.startswith("image"):
+        column = _safe_identifier(f"lookup_{column}", "lookup_field", max_len=64)
+    return column
+
+
+def _build_fixture_choice_list(
+    question: dict[str, Any],
+    name: str,
+    choice_lists: dict[str, list[Any]],
+    languages: list[str],
+    lookup_tables: dict[str, list[dict[str, Any]]],
+) -> str:
+    data_source = question.get("data_source") or {}
+    fixture_type = _fixture_type_from_data_source(data_source)
+    rows = lookup_tables.get(fixture_type, [])
+    value_ref = str(data_source.get("value_ref") or "id")
+    label_ref = str(data_source.get("label_ref") or value_ref)
+
+    list_name = _safe_identifier(name.lower(), "list", max_len=30)
+    if list_name in choice_lists:
+        suffix = 2
+        while f"{list_name}_{suffix}" in choice_lists:
+            suffix += 1
+        list_name = f"{list_name}_{suffix}"
+
+    used_values: set[str] = set()
+    choice_rows: list[dict[str, Any]] = []
+    for index, fixture_row in enumerate(rows, start=1):
+        fields = fixture_row.get("fields") or {}
+        raw_value = _fixture_field_value(fixture_row, value_ref) or str(fixture_row.get("id") or f"choice_{index}")
+        raw_label = _fixture_field_value(fixture_row, label_ref) or raw_value
+        choice_row: dict[str, Any] = {
+            "name": _safe_choice_value(raw_value, f"choice_{index}", used_values),
+            "_extra": {},
+        }
+        for lang in languages:
+            choice_row[f"label::{lang}"] = raw_label
+        for field_name in fields:
+            choice_row["_extra"][_choice_extra_column(field_name)] = _fixture_field_value(fixture_row, field_name)
+        choice_rows.append(choice_row)
+
+    choice_lists[list_name] = choice_rows
+    return list_name
+
+
+def _schema_question_type(
+    question: dict[str, Any],
+    name: str,
+    choice_lists: dict[str, list[Any]],
+    languages: list[str],
+    lookup_tables: dict[str, list[dict[str, Any]]],
+) -> str:
+    tag = str(question.get("tag") or "").lower()
+    qtype = str(question.get("type") or "").lower()
+
+    if tag == "trigger":
+        return "note"
+    if tag == "hidden" or qtype == "databindonly":
+        return "calculate" if question.get("calculate") else "text"
+    if tag in {"select1", "select"}:
+        data_source = question.get("data_source") or {}
+        fixture_type = _fixture_type_from_data_source(data_source)
+        if data_source and lookup_tables.get(fixture_type):
+            list_name = _build_fixture_choice_list(question, name, choice_lists, languages, lookup_tables)
+            return f"{'select_one' if tag == 'select1' else 'select_multiple'} {list_name}"
+
+        if not question.get("options"):
+            return "text"
+
+        list_name = _safe_identifier(name.lower(), "list", max_len=30)
+        if list_name in choice_lists:
+            suffix = 2
+            while f"{list_name}_{suffix}" in choice_lists:
+                suffix += 1
+            list_name = f"{list_name}_{suffix}"
+
+        used_values: set[str] = set()
+        options: list[tuple[str, dict[str, str]]] = []
+        for index, option in enumerate(question.get("options") or [], start=1):
+            value = _unique_name(str(option.get("value") or f"choice_{index}"), used_values)
+            option_labels = {
+                lang: _schema_labels(option, [lang])[f"label::{lang}"]
+                for lang in languages
+            }
+            options.append((value, option_labels))
+        choice_lists[list_name] = options
+        return f"{'select_one' if tag == 'select1' else 'select_multiple'} {list_name}"
+    if tag == "upload":
+        return {"audio": "audio", "image": "image"}.get(qtype, "file")
+    if qtype in {"int", "integer"}:
+        return "integer"
+    if qtype in {"double", "decimal"}:
+        return "decimal"
+    if qtype == "date":
+        return "date"
+    if qtype == "datetime":
+        return "dateTime"
+    if qtype == "geopoint":
+        return "geopoint"
+    return "text"
+
+
+def _is_path_within(path: str, parent: str) -> bool:
+    path = _normalize_ref(path)
+    parent = _normalize_ref(parent)
+    return path == parent or path.startswith(f"{parent}/")
+
+
+def _clean_schema_expression(
+    expr: str,
+    name_map: dict[str, str],
+    used_names: set[str],
+    warnings: list[str],
+    row_name: str,
+    field_name: str,
+) -> str:
+    expr = str(expr or "")
+    if not expr:
+        return ""
+    if "instance('casedb')" in expr or 'instance("casedb")' in expr:
+        warnings.append(f"{row_name}: omitted CommCare case-database {field_name}; Kobo cannot resolve casedb expressions.")
+        return ""
+    if "instance('commcaresession')" in expr or 'instance("commcaresession")' in expr:
+        warnings.append(f"{row_name}: omitted CommCare session {field_name}; Kobo cannot resolve commcaresession expressions.")
+        return ""
+    if "instance(" in expr:
+        warnings.append(f"{row_name}: omitted external-instance {field_name}; Kobo needs the matching external media file.")
+        return ""
+    return _clean_expression(expr, name_map, used_names)
+
+
+def _schema_choice_filter(question: dict[str, Any], name_map: dict[str, str]) -> str:
+    data_source = question.get("data_source") or {}
+    nodeset = str(data_source.get("nodeset") or "")
+    match = re.search(r"\[([^][]+)\]", nodeset)
+    if not match:
+        return ""
+    predicate = match.group(1).strip()
+    match = re.match(r"([A-Za-z_][\w.-]*)\s*=\s*((?:#form|/data)(?:/[A-Za-z0-9_.:-]+)+)$", predicate)
+    if match:
+        field_name = _choice_extra_column(match.group(1))
+        survey_name = name_map.get(_normalize_ref(match.group(2)), _ref_leaf(match.group(2)))
+        return f"{field_name}=${{{survey_name}}}"
+    match = re.match(r"((?:#form|/data)(?:/[A-Za-z0-9_.:-]+)+)\s*=\s*([A-Za-z_][\w.-]*)$", predicate)
+    if match:
+        survey_name = name_map.get(_normalize_ref(match.group(1)), _ref_leaf(match.group(1)))
+        field_name = _choice_extra_column(match.group(2))
+        return f"{field_name}=${{{survey_name}}}"
+    return ""
+
+
+def parse_commcare_schema(
+    app: dict[str, Any],
+    module: dict[str, Any],
+    form: dict[str, Any],
+    lookup_tables: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    lookup_tables = lookup_tables or {}
+    questions = form.get("questions") or []
+    languages = _question_languages(questions)
+    app_name = _translated_text(app.get("name"), "CommCare App")
+    module_name = _translated_text(module.get("name"), "Module")
+    form_name = _translated_text(form.get("name"), "Untitled Form")
+    title = f"{app_name} - {module_name} - {form_name}"
+
+    survey_rows: list[dict[str, Any]] = []
+    choice_lists: dict[str, list[tuple[str, dict[str, str]]]] = {}
+    used_names: set[str] = set()
+    name_map: dict[str, str] = {}
+    open_groups: list[tuple[str, str, str]] = []
+    warnings: list[str] = []
+
+    def close_to(parent_path: str) -> None:
+        while open_groups and not _is_path_within(parent_path, open_groups[-1][0]):
+            _path, name, tag = open_groups.pop()
+            survey_rows.append({"type": f"end_{tag}", "name": name})
+
+    for question in questions:
+        path = _normalize_ref(str(question.get("value") or question.get("hashtagValue") or ""))
+        tag = str(question.get("tag") or "").lower()
+        is_group = bool(question.get("is_group")) or tag in {"group", "repeat"}
+        parent_path = _normalize_ref(str(question.get("group") or question.get("repeat") or "/data"))
+
+        close_to(parent_path)
+
+        if is_group:
+            name = _make_body_name(path, used_names, name_map)
+            group_tag = "repeat" if tag == "repeat" or str(question.get("type") or "").lower() == "repeat" else "group"
+            row = {
+                "type": "begin_repeat" if group_tag == "repeat" else "begin_group",
+                "name": name,
+                "relevant": _clean_schema_expression(
+                    str(question.get("relevant") or ""),
+                    name_map,
+                    used_names,
+                    warnings,
+                    name,
+                    "relevance",
+                ),
+            }
+            row.update(_schema_labels(question, languages))
+            survey_rows.append(row)
+            open_groups.append((path, name, group_tag))
+            continue
+
+        name = _make_body_name(path, used_names, name_map)
+        row_type = _schema_question_type(question, name, choice_lists, languages, lookup_tables)
+        row = {
+            "type": row_type,
+            "name": name,
+            "required": "yes" if question.get("required") else "",
+            "relevant": _clean_schema_expression(
+                str(question.get("relevant") or ""),
+                name_map,
+                used_names,
+                warnings,
+                name,
+                "relevance",
+            ),
+            "calculation": _clean_schema_expression(
+                str(question.get("calculate") or question.get("setvalue") or ""),
+                name_map,
+                used_names,
+                warnings,
+                name,
+                "calculation",
+            ),
+            "constraint": _clean_schema_expression(
+                str(question.get("constraint") or ""),
+                name_map,
+                used_names,
+                warnings,
+                name,
+                "constraint",
+            ),
+        }
+        choice_filter = _schema_choice_filter(question, name_map)
+        if choice_filter:
+            row["choice_filter"] = choice_filter
+        if row_type == "calculate" and not row["calculation"]:
+            row["calculation"] = "''"
+        row.update(_schema_labels(question, languages))
+        if question.get("comment"):
+            for lang in languages:
+                row[f"hint::{lang}"] = str(question["comment"])
+        if row_type == "text" and str(question.get("tag") or "").lower() in {"select1", "select"} and not question.get("options"):
+            data_source = question.get("data_source") or {}
+            fixture_type = _fixture_type_from_data_source(data_source)
+            if data_source and not lookup_tables.get(fixture_type):
+                warnings.append(
+                    f"{name}: converted CommCare dynamic data-source select to text; "
+                    f"lookup table {fixture_type!r} was not available from the Fixture API."
+                )
+                for lang in languages:
+                    existing_hint = row.get(f"hint::{lang}", "")
+                    extra_hint = "CommCare dynamic lookup converted to text."
+                    row[f"hint::{lang}"] = f"{existing_hint} {extra_hint}".strip()
+            else:
+                warnings.append(f"{name}: converted select with no static or lookup-table options to text.")
+        survey_rows.append(row)
+
+    close_to("/data")
+
+    form_id = _safe_identifier(f"{app.get('id', app_name)}_{module_name}_{form_name}", "form", max_len=64)
+    return {
+        "title": title,
+        "form_id": form_id,
+        "languages": languages,
+        "survey_rows": survey_rows,
+        "choice_lists": choice_lists,
+        "warnings": warnings,
+    }
+
+
 HEADER_FILL = PatternFill("solid", fgColor="2F5496")
 HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
 GROUP_FILL = PatternFill("solid", fgColor="D9E1F2")
@@ -513,6 +907,25 @@ CALC_FILL = PatternFill("solid", fgColor="E2EFDA")
 DATA_FONT = Font(name="Arial", size=10)
 THIN = Side(style="thin", color="BFBFBF")
 CELL_BORDER = Border(bottom=THIN, right=THIN)
+
+
+def _normalize_choice_item(item: Any, languages: list[str]) -> dict[str, Any]:
+    """Coerce a choice-list item to a uniform dict.
+
+    Static selects store items as `(value, {lang: label})` tuples; fixture-backed
+    selects store them as dicts with `name`, `label::<lang>`, and `_extra` keys.
+    """
+    if isinstance(item, dict):
+        normalized = {"name": item.get("name", ""), "_extra": item.get("_extra") or {}}
+        for lang in languages:
+            normalized[f"label::{lang}"] = item.get(f"label::{lang}", "")
+        return normalized
+
+    value, item_labels = item
+    normalized = {"name": value, "_extra": {}}
+    for lang in languages:
+        normalized[f"label::{lang}"] = item_labels.get(lang, "")
+    return normalized
 
 
 def _write_sheet(ws, headers: list[str], rows: list[dict[str, Any]]) -> None:
@@ -554,6 +967,7 @@ def build_xlsform(parsed: dict[str, Any]) -> Workbook:
         [
             "required",
             "relevant",
+            "choice_filter",
             "calculation",
             "appearance",
             "constraint",
@@ -572,6 +986,7 @@ def build_xlsform(parsed: dict[str, Any]) -> Workbook:
     widths = [20, 35] + [55] * len(label_cols) + [35] * len(hint_cols) + [
         8,
         40,
+        35,
         55,
         15,
         40,
@@ -583,16 +998,28 @@ def build_xlsform(parsed: dict[str, Any]) -> Workbook:
         ws.column_dimensions[get_column_letter(idx)].width = width
 
     choices_sheet = wb.create_sheet("choices")
-    choices_headers = ["list_name", "name"] + label_cols
+    normalized_lists = {
+        list_name: [_normalize_choice_item(item, languages) for item in items]
+        for list_name, items in choice_lists.items()
+    }
+    extra_choice_cols: list[str] = []
+    for items in normalized_lists.values():
+        for item in items:
+            for col in item["_extra"]:
+                if col not in extra_choice_cols:
+                    extra_choice_cols.append(col)
+    choices_headers = ["list_name", "name"] + label_cols + extra_choice_cols
     choices_rows: list[dict[str, Any]] = []
-    for list_name, items in choice_lists.items():
-        for value, item_labels in items:
-            row = {"list_name": list_name, "name": value}
+    for list_name, items in normalized_lists.items():
+        for item in items:
+            row = {"list_name": list_name, "name": item["name"]}
             for lang in languages:
-                row[f"label::{lang}"] = item_labels.get(lang, "")
+                row[f"label::{lang}"] = item[f"label::{lang}"]
+            for col, value in item["_extra"].items():
+                row[col] = value
             choices_rows.append(row)
     _write_sheet(choices_sheet, choices_headers, choices_rows)
-    for idx, width in enumerate([20, 30] + [50] * len(label_cols), 1):
+    for idx, width in enumerate([20, 30] + [50] * len(label_cols) + [24] * len(extra_choice_cols), 1):
         choices_sheet.column_dimensions[get_column_letter(idx)].width = width
 
     settings_sheet = wb.create_sheet("settings")
@@ -612,7 +1039,7 @@ def build_xlsform(parsed: dict[str, Any]) -> Workbook:
 
 
 def validate_xlsform(parsed: dict[str, Any]) -> list[str]:
-    warnings: list[str] = []
+    warnings: list[str] = list(parsed.get("warnings", []))
     rows = parsed["survey_rows"]
     choice_lists = parsed["choice_lists"]
     names = [row.get("name", "") for row in rows if row.get("name")]
@@ -638,8 +1065,9 @@ def validate_xlsform(parsed: dict[str, Any]) -> list[str]:
 
     for list_name, items in choice_lists.items():
         seen: set[str] = set()
-        for value, _ in items:
-            if not VALID_XLSFORM_NAME.match(value):
+        for item in items:
+            value = str(item.get("name", "")) if isinstance(item, dict) else str(item[0])
+            if not VALID_CHOICE_NAME.match(value):
                 warnings.append(f"choice list {list_name} has invalid choice name: {value}")
             if value in seen:
                 warnings.append(f"choice list {list_name} has duplicate choice name: {value}")
@@ -652,6 +1080,15 @@ def workbook_to_bytes(wb: Workbook) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _response_summary(resp: requests.Response | None) -> str:
+    if resp is None:
+        return ""
+    try:
+        return str(resp.json())
+    except ValueError:
+        return resp.text[:1000]
 
 
 def _kobo_session(token: str) -> requests.Session:
@@ -688,8 +1125,10 @@ def kobo_upload_xlsform(session: requests.Session, server_url: str, xlsx_bytes: 
     if not poll_url:
         raise ValueError(f"Kobo import response did not include a poll URL: {import_resp.text}")
 
-    for _ in range(30):
-        time.sleep(2)
+    poll_attempts = 30
+    poll_interval = 2
+    for _ in range(poll_attempts):
+        time.sleep(poll_interval)
         poll = session.get(poll_url, timeout=30)
         poll.raise_for_status()
         result = poll.json()
@@ -701,7 +1140,9 @@ def kobo_upload_xlsform(session: requests.Session, server_url: str, xlsx_bytes: 
         if result.get("status") == "error":
             raise ValueError(f"Import failed: {result}")
 
-    raise TimeoutError("Import did not complete after 60 seconds")
+    raise TimeoutError(
+        f"Import did not complete after {poll_attempts * poll_interval} seconds"
+    )
 
 
 def kobo_deploy_asset(session: requests.Session, server_url: str, asset_uid: str) -> dict:
@@ -733,25 +1174,30 @@ def safe_filename(title: str) -> str:
     return _safe_identifier(title, "form", max_len=80)
 
 
-def _collect_xml_sources(args: argparse.Namespace) -> list[tuple[str, str]]:
+def _collect_sources(args: argparse.Namespace) -> list[tuple[str, str | dict[str, Any]]]:
     if args.commcare_fetch:
         if not args.commcare_domain or not args.commcare_user or not args.commcare_token:
             raise ValueError("CommCare fetch mode requires domain, user, and token.")
         session = _commcare_session(args.commcare_user, args.commcare_token)
         apps = _list_commcare_apps(session, args.commcare_domain, args.commcare_limit)
-        app_count = len(apps)
-        form_count = sum(
-            len(module.get("forms", []))
-            for app in apps
-            for module in app.get("modules", [])
-        )
-        raise NotImplementedError(
-            f"CommCare API access succeeded and returned {app_count} app(s) "
-            f"with {form_count} form definition(s), but this converter needs raw "
-            "XForm XML. CommCare's supported Application Structure API does not "
-            "return the full XForm XML needed by this XML parser. Export XML from "
-            "CommCare into XML_INPUT_FOLDER and run with COMMCARE_FETCH = False."
-        )
+        fixture_types = _collect_fixture_types(apps)
+        lookup_tables: dict[str, list[dict[str, Any]]] = {}
+        for fixture_type in fixture_types:
+            lookup_tables[fixture_type] = _list_commcare_fixture_rows(session, args.commcare_domain, fixture_type)
+        if lookup_tables:
+            print(
+                "  Fetched lookup table rows: "
+                + ", ".join(f"{name}={len(rows)}" for name, rows in sorted(lookup_tables.items()))
+            )
+        sources: list[tuple[str, dict[str, Any]]] = []
+        for app in apps:
+            for module in app.get("modules", []):
+                for form in module.get("forms", []):
+                    parsed = parse_commcare_schema(app, module, form, lookup_tables)
+                    sources.append((parsed["title"], parsed))
+
+        print(f"  Found {len(apps)} app(s) and {len(sources)} form schema(s) from CommCare\n")
+        return sources
 
     folder = Path(args.input_folder)
     if not folder.exists():
@@ -772,10 +1218,10 @@ def _collect_xml_sources(args: argparse.Namespace) -> list[tuple[str, str]]:
 
 def _process_source(
     label: str,
-    xml_str: str,
+    source: str | dict[str, Any],
     out_dir: Path | None,
 ) -> tuple[dict[str, Any] | None, Workbook | None, str | None, list[str]]:
-    parsed = parse_xform(xml_str)
+    parsed = source if isinstance(source, dict) else parse_xform(source)
     warnings = validate_xlsform(parsed)
     wb = build_xlsform(parsed)
     filename = f"{safe_filename(parsed['title'])}.xlsx"
@@ -789,13 +1235,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert CommCare XForm XML files to Kobo XLSForm.")
     parser.add_argument("--input-folder", default=str(XML_INPUT_FOLDER), help="Folder containing .xml files.")
     parser.add_argument("--output-folder", default=str(XLSFORM_OUTPUT_FOLDER), help="Folder for generated .xlsx files.")
-    parser.add_argument("--no-save", action="store_true", help="Do not save generated .xlsx files locally.")
-    parser.add_argument("--upload", action="store_true", default=UPLOAD_TO_KOBO, help="Upload generated XLSForms to KoboToolbox.")
+    parser.add_argument(
+        "--save",
+        action=argparse.BooleanOptionalAction,
+        default=SAVE_XLSFORMS_LOCALLY,
+        help="Save generated .xlsx files locally.",
+    )
+    parser.add_argument(
+        "--upload",
+        action=argparse.BooleanOptionalAction,
+        default=UPLOAD_TO_KOBO,
+        help="Upload generated XLSForms to KoboToolbox.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate only; do not upload even if UPLOAD_TO_KOBO is true.")
-    parser.add_argument("--deploy", action="store_true", default=KOBO_DEPLOY, help="Deploy uploaded Kobo forms.")
+    parser.add_argument(
+        "--deploy",
+        action=argparse.BooleanOptionalAction,
+        default=KOBO_DEPLOY,
+        help="Deploy uploaded Kobo forms.",
+    )
     parser.add_argument("--kobo-server-url", default=KOBO_SERVER_URL, help="KoboToolbox server URL.")
     parser.add_argument("--kobo-api-token", default=KOBO_API_TOKEN, help="Kobo API token. Prefer KOBO_API_TOKEN env var.")
-    parser.add_argument("--commcare-fetch", action="store_true", default=COMMCARE_FETCH, help="Fetch forms from CommCare.")
+    parser.add_argument(
+        "--commcare-fetch",
+        action=argparse.BooleanOptionalAction,
+        default=COMMCARE_FETCH,
+        help="Fetch CommCare app/form schema instead of reading XML_INPUT_FOLDER.",
+    )
     parser.add_argument("--commcare-domain", default=COMMCARE_DOMAIN, help="CommCare project domain.")
     parser.add_argument("--commcare-user", default=COMMCARE_USER, help="CommCare API username/email.")
     parser.add_argument("--commcare-token", default=COMMCARE_TOKEN, help="CommCare API token.")
@@ -806,7 +1272,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     uploading = bool(args.upload) and not args.dry_run
-    save_locally = SAVE_XLSFORMS_LOCALLY and not args.no_save
+    save_locally = bool(args.save)
 
     if uploading and not args.kobo_api_token:
         print("[ERROR] --upload requires KOBO_API_TOKEN or --kobo-api-token.", file=sys.stderr)
@@ -824,7 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     try:
-        sources = _collect_xml_sources(args)
+        sources = _collect_sources(args)
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
@@ -892,7 +1358,8 @@ def main(argv: list[str] | None = None) -> int:
                 tqdm.write(f"  [DEP ] {filename} deployed")
             except requests.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else "unknown"
-                tqdm.write(f"  [WARN] {filename}: deploy failed HTTP {status_code}")
+                body = _response_summary(exc.response)
+                tqdm.write(f"  [WARN] {filename}: deploy failed HTTP {status_code} - {body}")
             except Exception as exc:
                 tqdm.write(f"  [WARN] {filename}: deploy error - {exc}")
 
