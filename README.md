@@ -1,6 +1,6 @@
 # commcare-2-kobo
 
-Convert CommCare apps/forms to KoboToolbox XLSForm `.xlsx` files, with optional upload and deployment through the KoboToolbox API.
+Convert CommCare apps/forms to KoboToolbox XLSForm `.xlsx` files,  with optional upload and deployment through the KoboToolbox API.
 
 The script can fetch CommCare Application Structure API schema directly, including form questions and referenced lookup tables. It also supports plain XForm XML files and CommCare XML exported through Word XML. Word-wrapped XForms are detected and unwrapped automatically.
 
