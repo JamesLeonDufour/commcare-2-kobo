@@ -135,16 +135,16 @@ Kobo `choice_filter` expressions.
 Example dynamic lookup conversion:
 
 ```text
-CommCare data source: tarjetas.ocho_ultimos_digitos
-XLSForm type       : select_one num_8_tarejta
-choices columns    : list_name, name, label::es, Cod_departamento, Identificacion, Numero_Tarjeta_completo, ocho_ultimos_digitos
-choice_filter      : ocho_ultimos_digitos=${num_8_tarejta}
+CommCare data source: my_lookup_table.lookup_key
+XLSForm type       : select_one my_question
+choices columns    : list_name, name, label::en, field_a, field_b, lookup_key
+choice_filter      : lookup_key=${my_question}
 ```
 
 The script prints a lookup summary during API mode, for example:
 
 ```text
-Fetched lookup table rows: tarjetas=2991, Mun_Col=278
+Fetched lookup table rows: my_lookup_table=2991, another_table=278
 ```
 
 If you still want to test API access, set:
@@ -198,7 +198,7 @@ Warnings do not necessarily mean the XLSForm is invalid. They identify behavior 
 - The Application Structure API returns schema, not full raw XForm XML. Folder mode with exported XML is still the highest-fidelity path for XML-specific details.
 - Lookup-table choices are fetched from CommCare Fixture/Lookup Table rows and embedded into the XLSForm `choices` sheet. Large lookup tables can create large `.xlsx` files and slower Kobo imports.
 - Lookup-table fields are copied into the `choices` sheet as extra columns. Reserved XLSForm headers such as `name`, `list_name`, `label`, or `image` are renamed with a `lookup_` prefix, for example CommCare field `name` becomes `lookup_name`.
-- Simple lookup predicates like `departamento_id = /data/depto_registro` are converted to Kobo `choice_filter` syntax. Complex predicates that depend on CommCare case/session data are not preserved automatically.
+- Simple lookup predicates like `region_id = /data/selected_region` are converted to Kobo `choice_filter` syntax. Complex predicates that depend on CommCare case/session data are not preserved automatically.
 - CommCare `casedb` and `commcaresession` expressions are omitted with warnings because Kobo does not have those runtime objects.
 - A dry run validates generated workbooks locally, but only an upload/import/deploy attempt can catch every Kobo/PyXForm server-side rule.
 
