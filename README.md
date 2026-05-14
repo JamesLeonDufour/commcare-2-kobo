@@ -95,13 +95,19 @@ python commcare_2_kobo.py --kobo-server-url "https://kf.kobotoolbox.org"
 
 ## CommCare fetch mode
 
-You can pull XForms directly from CommCare instead of reading local files:
+CommCare's supported Application Structure API requires a plan with API
+access and the right app permissions. It can expose app/module/form schema,
+but it does not provide the same raw XForm XML as the CommCare XML export.
+For full conversion fidelity, export XML from CommCare into
+`XML_INPUT_FOLDER/` and run folder mode.
+
+If you still want to test API access, set:
 
 ```bash
 $env:COMMCARE_DOMAIN = "your-domain"
 $env:COMMCARE_USER = "you@example.org"
 $env:COMMCARE_TOKEN = "your-commcare-api-token"
-python commcare_2_kobo.py --commcare-fetch
+python commcare_2_kobo.py --commcare-fetch --dry-run
 ```
 
 Limit the number of fetched forms:

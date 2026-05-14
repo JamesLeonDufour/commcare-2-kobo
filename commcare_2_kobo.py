@@ -65,12 +65,15 @@ KOBO_SERVER_URL = "https://eu.kobotoolbox.org"
 KOBO_DEPLOY = True
 
 # CommCare fetch mode. Leave disabled when using XML_INPUT_FOLDER.
+# CommCare's supported API requires plan access and app permissions. If your
+# plan cannot use the Application Structure API, export XML from CommCare and
+# use folder mode instead.
 COMMCARE_FETCH = False
 COMMCARE_DOMAIN = ""
 COMMCARE_USER = ""
 COMMCARE_TOKEN = ""
 COMMCARE_LIMIT = 0
-COMMCARE_BASE_URL = "https://www.commcarehq.org"
+COMMCARE_BASE_URL = "https://eu.commcarehq.org"
 
 
 # Environment variables can override blank secrets and optional deployment
@@ -79,6 +82,8 @@ XML_INPUT_FOLDER = Path(os.getenv("XML_INPUT_FOLDER", XML_INPUT_FOLDER))
 XLSFORM_OUTPUT_FOLDER = Path(os.getenv("XLSFORM_OUTPUT_FOLDER", XLSFORM_OUTPUT_FOLDER))
 KOBO_API_TOKEN = KOBO_API_TOKEN or os.getenv("KOBO_API_TOKEN", "")
 KOBO_SERVER_URL = os.getenv("KOBO_SERVER_URL", KOBO_SERVER_URL)
+COMMCARE_DOMAIN = COMMCARE_DOMAIN or os.getenv("COMMCARE_DOMAIN", "")
+COMMCARE_USER = COMMCARE_USER or os.getenv("COMMCARE_USER", "")
 COMMCARE_TOKEN = COMMCARE_TOKEN or os.getenv("COMMCARE_TOKEN", "")
 COMMCARE_BASE_URL = os.getenv("COMMCARE_BASE_URL", COMMCARE_BASE_URL)
 
@@ -96,30 +101,47 @@ def _commcare_session(user: str, token: str) -> requests.Session:
     return session
 
 
-def _list_commcare_forms(session: requests.Session, domain: str, limit: int = 0) -> list[dict]:
-    url = f"{COMMCARE_BASE_URL}/a/{domain}/api/v0.5/xform/"
+def _raise_commcare_error(resp: requests.Response, context: str) -> None:
+    try:
+        message = resp.json().get("error", resp.text)
+    except Exception:
+        message = resp.text[:500]
+
+    if resp.status_code == 401 and "subscription" in message.lower():
+        raise PermissionError(
+            f"{context} failed: CommCare returned 401 - {message}. "
+            "This endpoint requires a CommCare plan with API access."
+        )
+    if resp.status_code == 401:
+        raise PermissionError(f"{context} failed: CommCare returned 401 - {message}")
+    if resp.status_code == 403:
+        raise PermissionError(f"{context} failed: CommCare returned 403 - {message}")
+    if resp.status_code == 404:
+        raise FileNotFoundError(
+            f"{context} failed: CommCare returned 404. Check COMMCARE_BASE_URL and COMMCARE_DOMAIN."
+        )
+
+    resp.raise_for_status()
+
+
+def _list_commcare_apps(session: requests.Session, domain: str, limit: int = 0) -> list[dict]:
+    url = f"{COMMCARE_BASE_URL.rstrip('/')}/a/{domain}/api/application/v1/"
     params = {"format": "json", "limit": 100, "offset": 0}
-    forms: list[dict] = []
-    print("  Fetching form list from CommCare...")
+    apps: list[dict] = []
+    print("  Checking CommCare Application Structure API...")
 
     while True:
         resp = session.get(url, params=params, timeout=30)
-        resp.raise_for_status()
+        if not resp.ok:
+            _raise_commcare_error(resp, "CommCare application fetch")
         data = resp.json()
-        forms.extend(data.get("objects", []))
-        if not data.get("meta", {}).get("next") or (limit and len(forms) >= limit):
+        apps.extend(data.get("objects", []))
+        if not data.get("meta", {}).get("next") or (limit and len(apps) >= limit):
             break
         params["offset"] += params["limit"]
         time.sleep(0.2)
 
-    return forms[:limit] if limit else forms
-
-
-def _fetch_commcare_xml(session: requests.Session, domain: str, form_id: str) -> str:
-    url = f"{COMMCARE_BASE_URL}/a/{domain}/api/v0.5/xform/{form_id}/"
-    resp = session.get(url, params={"format": "xml"}, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    return apps[:limit] if limit else apps
 
 
 def _strip_ns(tag: str) -> str:
@@ -716,21 +738,20 @@ def _collect_xml_sources(args: argparse.Namespace) -> list[tuple[str, str]]:
         if not args.commcare_domain or not args.commcare_user or not args.commcare_token:
             raise ValueError("CommCare fetch mode requires domain, user, and token.")
         session = _commcare_session(args.commcare_user, args.commcare_token)
-        metas = _list_commcare_forms(session, args.commcare_domain, args.commcare_limit)
-        print(f"  Found {len(metas)} form(s) on CommCare.\n")
-        sources = []
-        for meta in tqdm(metas, desc="Fetching XML", unit="form"):
-            fid = meta.get("id") or meta.get("resource_uri", "").rstrip("/").split("/")[-1]
-            label = meta.get("name") or meta.get("xmlns", fid)
-            if not fid:
-                tqdm.write(f"  [SKIP] No id in metadata: {meta}")
-                continue
-            try:
-                sources.append((label, _fetch_commcare_xml(session, args.commcare_domain, fid)))
-                time.sleep(0.1)
-            except Exception as exc:
-                tqdm.write(f"  [ERR ] {label}: {exc}")
-        return sources
+        apps = _list_commcare_apps(session, args.commcare_domain, args.commcare_limit)
+        app_count = len(apps)
+        form_count = sum(
+            len(module.get("forms", []))
+            for app in apps
+            for module in app.get("modules", [])
+        )
+        raise NotImplementedError(
+            f"CommCare API access succeeded and returned {app_count} app(s) "
+            f"with {form_count} form definition(s), but this converter needs raw "
+            "XForm XML. CommCare's supported Application Structure API does not "
+            "return the full XForm XML needed by this XML parser. Export XML from "
+            "CommCare into XML_INPUT_FOLDER and run with COMMCARE_FETCH = False."
+        )
 
     folder = Path(args.input_folder)
     if not folder.exists():
