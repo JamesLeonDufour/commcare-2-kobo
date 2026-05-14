@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -m py_compile commcare_2_kobo.py)",
-      "Bash(python commcare_2_kobo.py --help)"
-    ]
-  }
-}

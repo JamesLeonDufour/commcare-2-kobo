@@ -18,3 +18,5 @@ XML_INPUT_FOLDER/
 
 .DS_Store
 Thumbs.db
+
+.claude/
