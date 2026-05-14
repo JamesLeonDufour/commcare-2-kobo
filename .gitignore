@@ -13,5 +13,8 @@ env/
 XLS_OUTPUT/
 *.xlsx
 
+XML_INPUT_FOLDER/*.xml
+!XML_INPUT_FOLDER/.gitkeep
+
 .DS_Store
 Thumbs.db
